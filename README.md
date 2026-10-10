@@ -15,6 +15,8 @@
 <a href="https://github.com/GeoAtom/HomePodCast/releases/latest/download/HomePodCast.exe"><img src="https://img.shields.io/badge/Download%20for%20Windows-2ea44f?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" width="309"></a>
 &nbsp;
 <a href="https://www.buymeacoffee.com/geo2026"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="150"></a>
+&nbsp;
+<a href="https://afdian.com/a/geo2026"><img src="https://img.shields.io/badge/%E7%88%B1%E5%8F%91%E7%94%B5-%E6%94%AF%E6%8C%81%E6%88%91%E4%BB%AC-946ce6?style=for-the-badge" alt="爱发电 · 支持我们" width="190"></a>
 
 **[📖 Guide · 使用须知](docs/GUIDE.md)**
 

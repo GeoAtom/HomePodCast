@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3a3e"/>
+      <stop offset="1" stop-color="#141416"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffc233"/>
+      <stop offset="1" stop-color="#ff8a00"/>
+    </linearGradient>
+    <radialGradient id="pod" cx="0.4" cy="0.35" r="0.8">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d9d9de"/>
+    </radialGradient>
+  </defs>
+  <rect x="56" y="56" width="912" height="912" rx="208" fill="url(#tile)"/>
+  <!-- hairline so the tile keeps its edge on a dark taskbar -->
+  <rect x="62" y="62" width="900" height="900" rx="202" fill="none" stroke="#fff" stroke-opacity="0.16" stroke-width="12"/>
+  <!-- sound leaving the speaker on both sides -->
+  <g fill="none" stroke="url(#wave)" stroke-width="72" stroke-linecap="round">
+    <path d="M 698 326 A 264 264 0 0 1 698 698"/>
+    <path d="M 326 326 A 264 264 0 0 0 326 698"/>
+    <path d="M 800 250 A 390 390 0 0 1 800 774" opacity="0.55"/>
+    <path d="M 224 250 A 390 390 0 0 0 224 774" opacity="0.55"/>
+  </g>
+  <!-- the speaker, seen from above -->
+  <circle cx="512" cy="512" r="150" fill="url(#pod)"/>
+</svg>

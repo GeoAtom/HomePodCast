@@ -1,0 +1,5 @@
+pyatv==0.18.0
+SoundCard==0.4.6
+customtkinter>=5.2
+numpy>=2.0
+pyinstaller>=6.0

@@ -16,7 +16,7 @@
 &nbsp;
 <a href="https://www.buymeacoffee.com/geo2026"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="150"></a>
 &nbsp;
-<a href="https://afdian.com/a/geo2026"><img src="https://img.shields.io/badge/%E7%88%B1%E5%8F%91%E7%94%B5-%E6%94%AF%E6%8C%81%E6%88%91%E4%BB%AC-946ce6?style=for-the-badge" alt="爱发电 · 支持我们" width="190"></a>
+<a href="https://afdian.com/a/geo2026"><img src="docs/afdian-button.png" alt="去爱发电赞助" width="150"></a>
 
 **[📖 Guide · 使用须知](docs/GUIDE.md)**
 

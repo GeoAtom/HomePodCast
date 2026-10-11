@@ -66,6 +66,14 @@ HEADROOM_MS = 5  # added when growing so small increases do not cause another ju
 STATS_WINDOW = 120.0  # seconds of network history the buffer has to cover
 LOSS_MEMORY = 120.0  # seconds a lost packet keeps the buffer large enough to resend
 
+# A receiver that drops out of a running stream is reconnected (seconds)
+RETRY_S = 3.0  # between attempts
+RETRY_MAX_S = 300.0
+SETTLED_S = 30.0  # a connection that lasted this long was a good one
+SILENT_S = 10.0  # no answer on the RTSP connection for this long: gone
+CONNECT_TIMEOUT_S = 10.0
+SESSION_ACTIVE = 0x20000  # statusFlags bit: the receiver has an AirPlay session
+
 MODES = {
     "mono": ["mono"],
     "stereo": ["L", "R"],
@@ -366,6 +374,10 @@ class Control(ControlClient):
         super()._retransmit_lost_packets(request, addr)
 
 
+class Busy(Exception):
+    """The receiver is playing for another sender."""
+
+
 class Output:
     """One AirPlay receiver."""
 
@@ -380,8 +392,20 @@ class Output:
         self.conn = self.rtsp = self.proto = self.control = self.audio = None
         self.info = {}
         self.render_ms = DEFAULT_RENDER_MS
+        self.online = False  # connected and part of the stream
+        self.busy = False  # dropped out and now plays for another sender
+        self.polite = False  # its session flag can be trusted, see connect
+        self.joined = 0.0  # when it came online
+        self.heard = None  # when it last answered on the RTSP connection
+        self.retry = RETRY_S  # wait before reconnecting, should it drop out
+        self.first = True
+        self.opened = False  # a session was set up, so there is one to tear down
 
-    async def connect(self, timing_port: int):
+    async def connect(self, timing_port: int, polite: bool = None):
+        """Open the session. polite leaves a receiver alone that is in use.
+
+        Left out for the first connection, which finds out whether that works.
+        """
         loop = asyncio.get_running_loop()
         service = self.conf.get_service(Protocol.RAOP)
         self.ctx.credentials = extract_credentials(service)
@@ -417,7 +441,15 @@ class Output:
             local_addr=(self.conn.local_ip, 0),
         )
         self.info = await self.rtsp.info()
+        flags = self.info.get("statusFlags")
+        in_use = isinstance(flags, int) and bool(flags & SESSION_ACTIVE)
+        if polite and in_use:
+            raise Busy(self.name)
+        # A receiver that shows the flag before we ever played to it shows it for
+        # some other reason, so later on it cannot tell us that someone took over
+        self.polite = not in_use if polite is None else polite
         await self.proto.setup(timing_port, self.control.port)
+        self.opened = True
         self.audio, _ = await loop.create_datagram_endpoint(
             AudioProtocol, remote_addr=(self.conn.remote_ip, self.ctx.server_port)
         )
@@ -435,15 +467,19 @@ class Output:
         """How long after its nominal time a frame may arrive at the latest."""
         return DECLARED_LATENCY_MS + RENDER_OFFSET_MS - self.render_ms
 
-    def begin(self, start_ts: int):
-        self.ctx.start_ts = self.ctx.head_ts = start_ts
+    def begin(self, start_ts: int, head_ts: int):
+        """Join the shared timeline at head_ts."""
+        self.ctx.start_ts, self.ctx.head_ts = start_ts, head_ts
         self.control.start(self.conn.remote_ip)
+        self.online, self.joined = True, time.monotonic()
 
-    async def send(self, audio: bytes, first: bool):
+    async def send(self, audio: bytes):
         ctx = self.ctx
         header = AudioPacketHeader.encode(
-            0x80, 0xE0 if first else 0x60, ctx.rtpseq, ctx.rtptime, self.rtsp.session_id
+            0x80, 0xE0 if self.first else 0x60, ctx.rtpseq, ctx.rtptime,
+            self.rtsp.session_id,
         )
+        self.first = False
         seq, packet = await self.proto.send_audio_packet(self.audio, header, audio)
         self.backlog[seq] = packet
         ctx.rtpseq = (ctx.rtpseq + 1) % 2**16
@@ -452,6 +488,13 @@ class Output:
     @property
     def alive(self) -> bool:
         return self.conn is not None and self.conn.transport is not None
+
+    @property
+    def lost(self) -> bool:
+        """The receiver closed the session, or no longer answers."""
+        if not self.alive or self.audio.is_closing():
+            return True
+        return self.heard is not None and time.monotonic() - self.heard > SILENT_S
 
     @property
     def volume(self):
@@ -465,7 +508,7 @@ class Output:
     async def close(self):
         if self.control:
             self.control.stop()
-        if self.rtsp and self.alive:
+        if self.opened and self.alive:
             try:
                 await asyncio.wait_for(self.rtsp.teardown(self.ctx.rtsp_session), 2)
             except Exception:  # pylint: disable=broad-except
@@ -506,7 +549,10 @@ class Engine:
         self.send_late = Window(STATS_WINDOW)  # how late the send loop ran, ms
         self.inject = {}  # output index -> test sound still to be mixed in
         self.testing = False  # a stream that exists only to play a test sound
+        self.start_ts = self.head = 0  # the shared timeline: its origin, and what is sent
+        self.volume = None  # percent, once it has been set for this stream
         self._task = None
+        self._rejoins = {}  # output index -> task reconnecting that receiver
 
     def _run_loop(self):
         # Default Windows timer granularity (15.6 ms) is coarser than one packet
@@ -555,6 +601,9 @@ class Engine:
             "outputs": [
                 {
                     "name": o.name,
+                    "online": o.online,
+                    "busy": o.busy,
+                    "age": time.monotonic() - o.joined,
                     "timing": self.timing.requests.get(o.address, 0),
                     "resends": o.control.resends if o.control else 0,
                     "volume": o.volume,
@@ -575,6 +624,7 @@ class Engine:
             raise RuntimeError("already running")
         self.state, self.error = "connecting", None
         self.underruns = 0
+        self.volume = None
         self.timing.requests.clear()
         self.outputs = [Output(conf, self.clock) for conf in confs]
         try:
@@ -609,6 +659,10 @@ class Engine:
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        rejoins, self._rejoins = list(self._rejoins.values()), {}
+        for rejoin in rejoins:
+            rejoin.cancel()
+        await asyncio.gather(*rejoins, return_exceptions=True)
         if self.capture:
             self.capture.stop()
             self.capture = None
@@ -648,7 +702,49 @@ class Engine:
         self.outputs = []
 
     async def _set_volume(self, percent):
-        await asyncio.gather(*(o.set_volume(percent) for o in self.outputs))
+        self.volume = percent
+        await asyncio.gather(*(o.set_volume(percent) for o in self.outputs if o.online))
+
+    def _drop(self, index):
+        """Take a lost receiver out of the stream and start getting it back."""
+        out = self.outputs[index]
+        out.online = False
+        self._rejoins[index] = asyncio.ensure_future(self._rejoin(index, out))
+
+    async def _rejoin(self, index, old):
+        """Reconnect a receiver and put it back on the shared timeline."""
+        # One that drops us again right away has most likely been taken by another
+        # sender. Every such round quadruples the wait instead of fighting over it.
+        brief = time.monotonic() - old.joined < SETTLED_S
+        wait = min(old.retry * 4, RETRY_MAX_S) if brief else RETRY_S
+        await old.close()
+        while True:
+            await asyncio.sleep(wait)
+            new = Output(old.conf, self.clock)
+            new.retry = wait
+            # The FLUSH sent while connecting names the RTP time the stream is at.
+            # Left at zero, a receiver would take a stream older than 13 hours
+            # (half the 32-bit range) for one that lies before the flush.
+            new.ctx.start_ts, new.ctx.head_ts = self.start_ts, self.head
+            try:
+                await asyncio.wait_for(
+                    new.connect(self.timing.port, old.polite), CONNECT_TIMEOUT_S
+                )
+                if self.volume is not None:
+                    await new.set_volume(self.volume)
+                break
+            except BaseException as ex:
+                await new.close()
+                if not isinstance(ex, Exception):
+                    raise
+                old.busy = isinstance(ex, Busy)
+
+        self.timing.requests.pop(new.address, None)
+        self.deadline_ms = min(self.deadline_ms, new.deadline_ms)
+        self.render_ms = max(self.render_ms, new.render_ms)
+        new.begin(self.start_ts, self.head)
+        self.outputs[index] = new
+        self._rejoins.pop(index, None)
 
     def _adapt(self):
         """Pick the smallest buffer that covers what the network did recently."""
@@ -681,13 +777,11 @@ class Engine:
         def lag_for(buffer_ms):
             return int((self.deadline_ms - buffer_ms) * RATE / 1000)
 
-        start_ts = clock.ts_now()
+        self.start_ts = self.head = clock.ts_now()
         for out in outputs:
-            out.begin(start_ts)
-        head = start_ts
+            out.begin(self.start_ts, self.head)
         # A frame with nominal time T is sent at T + lag
         lag = lag_for(self.buffer_target)
-        first = True
         prefill = True
         fill_avg = float(TARGET_FILL)
         packets = 0
@@ -704,12 +798,12 @@ class Engine:
                     # the capture buffer runs dry once, which is a short dropout.
                     lag, settled = target, False
 
-                due = clock.ts_now() - lag - head
+                due = clock.ts_now() - lag - self.head
                 if due > 2 * RATE:  # stalled for seconds, skip instead of bursting
                     skip = due // FPP * FPP
                     for out in outputs:
                         out.ctx.head_ts += skip
-                    head += skip
+                    self.head += skip
                     due -= skip
                     settled = False
                 if settled and due > late_max:
@@ -781,9 +875,9 @@ class Engine:
                         ]
 
                     for out, payload in zip(outputs, payloads):
-                        await out.send(payload, first)
-                    first = False
-                    head += FPP
+                        if out.online:
+                            await out.send(payload)
+                    self.head += FPP
                     packets += 1
                 if count < 25:
                     settled = True
@@ -798,10 +892,13 @@ class Engine:
                     if self.auto:
                         self._adapt()
                     if seconds % 2 == 0:
-                        for out in outputs:
-                            if not out.alive:
-                                raise ConnectionError("disconnected", out.name)
-                            asyncio.ensure_future(self._feedback(out))
+                        for index, out in enumerate(outputs):
+                            if not out.online:
+                                continue
+                            if out.lost:
+                                self._drop(index)
+                            else:
+                                asyncio.ensure_future(self._feedback(out))
                         if self.capture and self.capture.error:
                             raise RuntimeError("capture", str(self.capture.error))
 
@@ -809,7 +906,7 @@ class Engine:
         except asyncio.CancelledError:
             raise
         except Exception as ex:  # pylint: disable=broad-except
-            known = len(ex.args) == 2 and ex.args[0] in ("disconnected", "capture")
+            known = len(ex.args) == 2 and ex.args[0] == "capture"
             self.error = tuple(ex.args) if known else ("error", str(ex) or type(ex).__name__)
             self._task = None
             await self._stop()
@@ -818,5 +915,6 @@ class Engine:
     async def _feedback(out):
         try:
             await out.rtsp.feedback(allow_error=True)
+            out.heard = time.monotonic()
         except Exception:  # pylint: disable=broad-except
             pass

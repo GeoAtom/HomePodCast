@@ -1,18 +1,33 @@
 """HomePod Cast: stream Windows system audio to 1, 2 or 4 HomePods."""
 
+from concurrent.futures import Future
 import ctypes
 import json
 import math
 import os
 import sys
+import threading
 import tkinter as tk
+import urllib.request
+import webbrowser
+import winreg
 
 import customtkinter as ctk
 
 import engine as eng
 
 APP_NAME = "HomePod Cast"
+VERSION = "1.1.0"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", "."), "HomePodCast", "config.json")
+RELEASES = "https://github.com/GeoAtom/HomePodCast/releases/latest"
+LATEST_API = "https://api.github.com/repos/GeoAtom/HomePodCast/releases/latest"
+
+# Where Windows keeps the programs it starts at sign-in
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "HomePodCast"
+# At sign-in the network may not be up yet: scan this often before giving up
+AUTOSTART_SCANS = 20
+AUTOSTART_RETRY_MS = 5000
 
 # Network buffer choices in ms; None is automatic
 BUFFERS = [None, 20, 40, 80, 150, 300]
@@ -33,6 +48,8 @@ TEXT = ("#1d1d1f", "#f5f5f7")
 MUTED = ("#6e6e73", "#98989d")
 FAINT = ("#c7c7cc", "#48484a")
 ACCENT, ACCENT_HOVER, INK = "#ff9f0a", "#f59000", "#1d1d1f"
+LINK = ("#b25000", "#ff9f0a")
+KNOB = "#ffffff"
 AMBER, GREEN, RED = "#ff9f0a", "#34c759", "#ff453a"
 
 STRINGS = {
@@ -57,6 +74,11 @@ STRINGS = {
         "buffer": "缓冲",
         "auto": "自动",
         "language": "语言",
+        "startup": "自启",
+        "startup_on": "登录 Windows 后自动串流",
+        "version": "版本",
+        "update": "{current}  →  下载 {latest}",
+        "update_hint": "有新版本 {latest}",
         "scanning": "正在扫描局域网…",
         "found": "找到 {count} 台 AirPlay 音箱",
         "none_found": "没有找到 AirPlay 音箱",
@@ -71,7 +93,8 @@ STRINGS = {
         "streaming_auto": "串流中 · 延迟约 {latency} ms · 自动缓冲 {buffer} ms",
         "testing": "正在 {name} 上播放测试音…",
         "test_failed": "测试音播放失败：{error}",
-        "err_disconnected": "{detail} 断开了连接",
+        "reconnecting": "{names} 断开了连接，正在重连…",
+        "waiting": "{names} 正被其他设备使用，空闲后会自动重连。",
         "err_capture": "音频采集失败：{detail}",
         "err_error": "{detail}",
         "access_hint": "请在“家庭”App → 家庭设置 → 扬声器与电视中允许“同一网络上的任何人”。",
@@ -99,6 +122,11 @@ STRINGS = {
         "buffer": "Buffer",
         "auto": "Auto",
         "language": "Language",
+        "startup": "Startup",
+        "startup_on": "Stream when I sign in to Windows",
+        "version": "Version",
+        "update": "{current}  →  get {latest}",
+        "update_hint": "Version {latest} is out",
         "scanning": "Scanning the network…",
         "found": "Found {count} AirPlay speaker(s)",
         "none_found": "No AirPlay speakers found",
@@ -113,7 +141,8 @@ STRINGS = {
         "streaming_auto": "Streaming · about {latency} ms latency · auto buffer {buffer} ms",
         "testing": "Playing a test sound on {name}…",
         "test_failed": "Test sound failed: {error}",
-        "err_disconnected": "{detail} disconnected",
+        "reconnecting": "{names} disconnected. Reconnecting…",
+        "waiting": "{names} is in use by another device. It will reconnect once free.",
         "err_capture": "Audio capture failed: {detail}",
         "err_error": "{detail}",
         "access_hint": "In the Home app → Home Settings → Speakers & TV, allow "
@@ -150,6 +179,67 @@ def save_config(config: dict):
         pass
 
 
+def launch_command() -> str:
+    """Command line that starts this program streaming, out of the way."""
+    if getattr(sys, "frozen", False):
+        program = f'"{sys.executable}"'
+    else:
+        windowed = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        python = windowed if os.path.exists(windowed) else sys.executable
+        program = f'"{python}" "{os.path.abspath(__file__)}"'
+    return program + " --autostart --minimized"
+
+
+def startup_command():
+    """What Windows runs for us at sign-in, or None."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            return winreg.QueryValueEx(key, RUN_NAME)[0]
+    except OSError:
+        return None
+
+
+def set_startup(enabled: bool):
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, launch_command())
+            else:
+                winreg.DeleteValue(key, RUN_NAME)
+    except OSError:
+        pass
+
+
+def newer_version():
+    """Version of the latest release on GitHub if it is newer than this one."""
+
+    def numbers(version):
+        return tuple(int(part) for part in version.split("."))
+
+    request = urllib.request.Request(
+        LATEST_API, headers={"User-Agent": f"HomePodCast/{VERSION}"}
+    )
+    with urllib.request.urlopen(request, timeout=5) as reply:
+        latest = json.load(reply)["tag_name"].lstrip("v")
+    return latest if numbers(latest) > numbers(VERSION) else None
+
+
+def in_background(function) -> Future:
+    """Run a blocking function in its own thread."""
+    future = Future()
+
+    def work():
+        try:
+            future.set_result(function())
+        except Exception as ex:  # pylint: disable=broad-except
+            future.set_exception(ex)
+
+    threading.Thread(target=work, daemon=True).start()
+    return future
+
+
 class App:
     def __init__(self):
         self.config = load_config()
@@ -165,8 +255,12 @@ class App:
         self.testing = 0  # test sounds being played while not streaming
         self.volume_synced = False
         self.show_settings = False
-        # --autostart: begin streaming with the saved setup once devices are found
-        self.autostart = "--autostart" in sys.argv
+        self.update = None  # version of a newer release
+        # --autostart: begin streaming with the saved setup once devices are found.
+        # Counts the scans that may still be spent on finding them.
+        self.autostart = AUTOSTART_SCANS if "--autostart" in sys.argv else 0
+        if getattr(sys, "frozen", False) and startup_command() not in (None, launch_command()):
+            set_startup(True)  # the exe has been moved since
 
         ctk.set_appearance_mode("system")
         self.root = root = ctk.CTk(fg_color=SURFACE)
@@ -195,7 +289,12 @@ class App:
         self.status_text = ("scanning", {}, "")
         self.body = None
         self.build()
+        if "--minimized" in sys.argv:
+            # Once the main loop runs: customtkinter leaves a window hidden for good
+            # that is minimised before it has been shown
+            root.after(0, root.iconify)
         self.scan()
+        self.pending.append((in_background(newer_version), self.checked))
         self.tick()
 
     def tr(self, key: str, **values) -> str:
@@ -301,6 +400,23 @@ class App:
         self.language_box.set(LANGUAGES[self.lang])
         self.language_box.pack(side="left")
 
+        row = self.setting_row(self.tr("startup"))
+        self.startup_var = tk.BooleanVar(value=startup_command() is not None)
+        ctk.CTkSwitch(
+            row, text=self.tr("startup_on"), variable=self.startup_var, font=self.font,
+            command=lambda: set_startup(self.startup_var.get()), width=WIDTH - LABEL,
+            height=30, text_color=TEXT, fg_color=FAINT, progress_color=GREEN,
+            button_color=KNOB, button_hover_color=KNOB,
+        ).pack(side="left")
+
+        row = self.setting_row(self.tr("version"))
+        self.version_button = ctk.CTkButton(
+            row, command=self.open_release, width=WIDTH - LABEL, height=26, anchor="w",
+            font=self.font, fg_color="transparent",
+        )
+        self.version_button.pack(side="left")
+        self.show_version()
+
         self.build_roles()
         self.place_settings()
         self.set_status(*self.status_text)
@@ -370,9 +486,21 @@ class App:
         if len(labels) == 1 and len(self.role_vars) == 1:
             self.role_vars["mono"].set(labels[0])
 
+    def show_version(self):
+        if self.update:
+            self.version_button.configure(
+                text=self.tr("update", current=VERSION, latest=self.update),
+                text_color=LINK, hover_color=FIELD, cursor="hand2",
+            )
+        else:
+            self.version_button.configure(
+                text=VERSION, text_color=MUTED, hover_color=SURFACE, cursor="",
+            )
+
     def place_settings(self):
         arrow = "▴" if self.show_settings else "▾"
-        self.settings_button.configure(text=f"{self.tr('settings')}  {arrow}")
+        hint = f"    {self.tr('update_hint', latest=self.update)}" if self.update else ""
+        self.settings_button.configure(text=f"{self.tr('settings')}  {arrow}{hint}")
         if self.show_settings:
             self.settings.pack(pady=(2, 0))
         else:
@@ -460,6 +588,8 @@ class App:
             self.scan_button.configure(state="normal")
         if error:
             self.set_status("scan_failed", {"error": error})
+            if self.autostart and not self.running:
+                self.retry_autostart()
             return
         names = [c.name for c in confs]
         self.confs = {
@@ -473,8 +603,30 @@ class App:
         else:
             self.set_status("none_found")
         if self.autostart and not self.running:
-            self.autostart = False
-            self.toggle()
+            chosen = [self.role_vars[role].get() for role in eng.MODES[self.mode]]
+            if all(label in self.confs for label in chosen):
+                self.toggle()
+            else:
+                self.retry_autostart()
+
+    def retry_autostart(self):
+        """Scan again in a while: at sign-in the speakers may not be reachable yet."""
+        self.autostart -= 1
+        if self.autostart > 0:
+            self.root.after(AUTOSTART_RETRY_MS, self.rescan)
+
+    def rescan(self):
+        if self.autostart and not self.running and not self.testing:
+            self.scan()
+
+    def checked(self, version, error):
+        self.update = None if error else version
+        self.show_version()
+        self.place_settings()
+
+    def open_release(self):
+        if self.update:
+            webbrowser.open(RELEASES)
 
     def test(self, role):
         """Play a test sound on the speaker picked for this channel."""
@@ -507,6 +659,7 @@ class App:
             self.set_status("found", {"count": len(self.confs)})
 
     def toggle(self):
+        self.autostart = 0
         if self.running:
             self.start_button.configure(state="disabled")
             self.pending.append((self.engine.stop(), lambda *_: self.stopped("stopped")))
@@ -599,16 +752,22 @@ class App:
             decibel = 20 * math.log10(max(st["level"], 1e-6))
             self.show_level(min(max(0.0, 1 + decibel / 60), 1.0))
 
-            silent = []
+            silent, lost, busy = [], [], []
             for role, out in zip(eng.MODES[self.mode], st["outputs"]):
-                synced = out["timing"] > 0
-                late = not synced and st["elapsed"] > 5
+                synced = out["online"] and out["timing"] > 0
+                late = out["online"] and not synced and out["age"] > 5
                 self.role_dots[role].configure(
                     text_color=GREEN if synced else RED if late else AMBER
                 )
                 if late:
                     silent.append(out["name"])
-            if silent:
+                elif not out["online"]:
+                    (busy if out["busy"] else lost).append(out["name"])
+            if lost:
+                self.set_status("reconnecting", {"names": ", ".join(lost)})
+            elif busy:
+                self.set_status("waiting", {"names": ", ".join(busy)})
+            elif silent:
                 self.set_status("firewall_hint", {"names": ", ".join(silent)})
             else:
                 self.set_status(

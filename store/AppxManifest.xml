@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Package manifest of the Microsoft Store build. build.ps1 -Store fills in the
+     version. Identity and PublisherDisplayName are the values Partner Center shows
+     under Product management > Product identity; the Store rejects any others. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 desktop desktop2 rescap">
+
+  <Identity
+    Name="IDENTITY-NAME-FROM-PARTNER-CENTER"
+    Publisher="CN=00000000-0000-0000-0000-000000000000"
+    Version="0.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>HomePod Cast</DisplayName>
+    <PublisherDisplayName>PUBLISHER-DISPLAY-NAME-FROM-PARTNER-CENTER</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- 19041 (Windows 10 2004) is the first build that passes Parameters to a startup task -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+    <Resource Language="zh-cn" />
+  </Resources>
+
+  <Applications>
+    <Application Id="HomePodCast" Executable="HomePodCast.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="HomePod Cast"
+        Description="Windows audio to 1, 2 or 4 HomePods, in sync"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <!-- Off until the user turns it on under Settings > Apps > Startup -->
+        <desktop:Extension
+          Category="windows.startupTask"
+          Executable="HomePodCast.exe"
+          EntryPoint="Windows.FullTrustApplication"
+          uap10:Parameters="--autostart --minimized">
+          <desktop:StartupTask TaskId="HomePodCastStartup" Enabled="false" DisplayName="HomePod Cast" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Extensions>
+    <!-- The speakers send timing and resend requests back to this PC -->
+    <desktop2:Extension Category="windows.firewallRules">
+      <desktop2:FirewallRules Executable="HomePodCast.exe">
+        <desktop2:Rule Direction="in" IPProtocol="UDP" Profile="private" />
+        <desktop2:Rule Direction="in" IPProtocol="UDP" Profile="domain" />
+      </desktop2:FirewallRules>
+    </desktop2:Extension>
+  </Extensions>
+</Package>

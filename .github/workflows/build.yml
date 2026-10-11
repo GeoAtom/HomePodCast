@@ -1,5 +1,6 @@
-# Builds HomePodCast.exe on every push. A tag v<VERSION> also drafts the release
-# with the exe attached; publishing the draft is done by hand.
+# Builds HomePodCast.exe and the Microsoft Store package on every push. A tag
+# v<VERSION> also drafts the release with the exe attached. Publishing the draft,
+# and submitting the package in Partner Center, are done by hand.
 name: Build
 
 on:
@@ -37,6 +38,26 @@ jobs:
         with:
           name: HomePodCast
           path: dist/HomePodCast.exe
+          if-no-files-found: error
+
+  store:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: .\build.ps1 -Store
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: HomePodCast-store
+          path: dist/HomePodCast.msix
           if-no-files-found: error
 
   release:

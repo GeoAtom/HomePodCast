@@ -56,6 +56,7 @@ Windows 10/11, Python 3.12.
 pip install -r requirements.txt
 python app.py     # run
 .\build.ps1       # build dist\HomePodCast.exe
+.\build.ps1 -Store   # build dist\HomePodCast.msix for the Microsoft Store (needs the Windows SDK)
 ```
 
 `engine.py` captures, routes and streams; `app.py` is the window. `--autostart` starts streaming with the last setup, `--minimized` starts minimised.

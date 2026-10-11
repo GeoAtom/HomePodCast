@@ -78,6 +78,7 @@ STRINGS = {
         "dropout_on": "自动重连掉线的音箱",
         "startup": "自启",
         "startup_on": "登录 Windows 后自动串流",
+        "startup_store": "在 Windows 设置的“启动”中开关  ↗",
         "version": "版本",
         "update": "{current}  →  下载 {latest}",
         "update_hint": "有新版本 {latest}",
@@ -129,6 +130,7 @@ STRINGS = {
         "dropout_on": "Reconnect speakers that drop out",
         "startup": "Startup",
         "startup_on": "Stream when I sign in to Windows",
+        "startup_store": "Turn on or off in Windows Settings  ↗",
         "version": "Version",
         "update": "{current}  →  get {latest}",
         "update_hint": "Version {latest} is out",
@@ -183,6 +185,22 @@ def save_config(config: dict):
             json.dump(config, file, ensure_ascii=False, indent=1)
     except OSError:
         pass
+
+
+def packaged() -> bool:
+    """Whether this is the Microsoft Store package rather than the plain exe."""
+    try:
+        length = ctypes.c_uint32(0)
+        # 15700 is APPMODEL_ERROR_NO_PACKAGE
+        found = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
+    except (AttributeError, OSError):
+        return False
+    return found != 15700
+
+
+# The Store updates the package and Windows starts it at sign-in (a startup task in
+# the package manifest), so there the app does neither itself
+STORE = packaged()
 
 
 def launch_command() -> str:
@@ -265,7 +283,8 @@ class App:
         # --autostart: begin streaming with the saved setup once devices are found.
         # Counts the scans that may still be spent on finding them.
         self.autostart = AUTOSTART_SCANS if "--autostart" in sys.argv else 0
-        if getattr(sys, "frozen", False) and startup_command() not in (None, launch_command()):
+        moved = startup_command() not in (None, launch_command())
+        if getattr(sys, "frozen", False) and not STORE and moved:
             set_startup(True)  # the exe has been moved since
 
         ctk.set_appearance_mode("system")
@@ -301,7 +320,8 @@ class App:
             # that is minimised before it has been shown
             root.after(0, root.iconify)
         self.scan()
-        self.pending.append((in_background(newer_version), self.checked))
+        if not STORE:
+            self.pending.append((in_background(newer_version), self.checked))
         self.tick()
 
     def tr(self, key: str, **values) -> str:
@@ -414,9 +434,16 @@ class App:
         self.reconnect_box.pack(side="left")
 
         row = self.setting_row(self.tr("startup"))
-        self.switch(
-            row, self.tr("startup_on"), startup_command() is not None, set_startup
-        ).pack(side="left")
+        if STORE:
+            ctk.CTkButton(
+                row, text=self.tr("startup_store"), width=WIDTH - LABEL, height=30,
+                anchor="w", font=self.font, fg_color="transparent", hover_color=FIELD,
+                text_color=LINK, command=lambda: os.startfile("ms-settings:startupapps"),
+            ).pack(side="left")
+        else:
+            self.switch(
+                row, self.tr("startup_on"), startup_command() is not None, set_startup
+            ).pack(side="left")
 
         row = self.setting_row(self.tr("version"))
         self.version_button = ctk.CTkButton(

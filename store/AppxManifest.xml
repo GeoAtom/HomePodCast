@@ -12,14 +12,14 @@
   IgnorableNamespaces="uap uap10 desktop desktop2 rescap">
 
   <Identity
-    Name="IDENTITY-NAME-FROM-PARTNER-CENTER"
-    Publisher="CN=00000000-0000-0000-0000-000000000000"
+    Name="GeoAtom.HomePodCast"
+    Publisher="CN=E420B498-6EAE-4C3E-A46F-BFEA6DE8546C"
     Version="0.0.0.0"
     ProcessorArchitecture="x64" />
 
   <Properties>
     <DisplayName>HomePod Cast</DisplayName>
-    <PublisherDisplayName>PUBLISHER-DISPLAY-NAME-FROM-PARTNER-CENTER</PublisherDisplayName>
+    <PublisherDisplayName>GeoAtom</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
 

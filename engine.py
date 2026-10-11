@@ -250,10 +250,26 @@ class Ring:
             self.n -= k
 
 
+def soundcard():
+    """The SoundCard module, with room for a whole PROPVARIANT.
+
+    SoundCard allocates 16 bytes for one, but Windows writes 24 when the property
+    is a blob, as the format of a device is. That runs past the block: a plain
+    process gets away with it, a Microsoft Store package is ended for it.
+    """
+    import soundcard as sc
+    from soundcard import mediafoundation as mf
+
+    def allocate(self):
+        self.ptr = mf._ffi.cast("PROPVARIANT *", mf._ole32.CoTaskMemAlloc(24))
+
+    mf._PropVariant.__init__ = allocate
+    return sc
+
+
 def list_sources():
     """Return (id, name, channels) of all output devices, default first."""
-    import soundcard as sc
-
+    sc = soundcard()
     default = sc.default_speaker()
     speakers = [default] + [s for s in sc.all_speakers() if s.id != default.id]
     return [(s.id, s.name, s.channels) for s in speakers]
@@ -273,8 +289,7 @@ class Capture(threading.Thread):
     def run(self):
         ctypes.windll.ole32.CoInitializeEx(None, 0)
         try:
-            import soundcard as sc
-
+            sc = soundcard()
             warnings.simplefilter("ignore", sc.SoundcardRuntimeWarning)
             mic = sc.get_microphone(self.source_id, include_loopback=True)
             with mic.recorder(RATE, channels=self.channels, blocksize=RATE // 100) as rec:

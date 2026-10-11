@@ -74,6 +74,8 @@ STRINGS = {
         "buffer": "缓冲",
         "auto": "自动",
         "language": "语言",
+        "dropout": "断线",
+        "dropout_on": "自动重连掉线的音箱",
         "startup": "自启",
         "startup_on": "登录 Windows 后自动串流",
         "version": "版本",
@@ -95,6 +97,7 @@ STRINGS = {
         "test_failed": "测试音播放失败：{error}",
         "reconnecting": "{names} 断开了连接，正在重连…",
         "waiting": "{names} 正被其他设备使用，空闲后会自动重连。",
+        "err_disconnected": "{detail} 断开了连接",
         "err_capture": "音频采集失败：{detail}",
         "err_error": "{detail}",
         "access_hint": "请在“家庭”App → 家庭设置 → 扬声器与电视中允许“同一网络上的任何人”。",
@@ -122,6 +125,8 @@ STRINGS = {
         "buffer": "Buffer",
         "auto": "Auto",
         "language": "Language",
+        "dropout": "Dropout",
+        "dropout_on": "Reconnect speakers that drop out",
         "startup": "Startup",
         "startup_on": "Stream when I sign in to Windows",
         "version": "Version",
@@ -143,6 +148,7 @@ STRINGS = {
         "test_failed": "Test sound failed: {error}",
         "reconnecting": "{names} disconnected. Reconnecting…",
         "waiting": "{names} is in use by another device. It will reconnect once free.",
+        "err_disconnected": "{detail} disconnected",
         "err_capture": "Audio capture failed: {detail}",
         "err_error": "{detail}",
         "access_hint": "In the Home app → Home Settings → Speakers & TV, allow "
@@ -285,6 +291,7 @@ class App:
         )
         saved_buffer = self.config.get("buffer")
         self.buffer = saved_buffer if saved_buffer in BUFFERS else None
+        self.reconnect = self.config.get("reconnect") is not False
         self.volume = tk.DoubleVar(value=30)
         self.status_text = ("scanning", {}, "")
         self.body = None
@@ -400,13 +407,15 @@ class App:
         self.language_box.set(LANGUAGES[self.lang])
         self.language_box.pack(side="left")
 
+        row = self.setting_row(self.tr("dropout"))
+        self.reconnect_box = self.switch(
+            row, self.tr("dropout_on"), self.reconnect, self.set_reconnect
+        )
+        self.reconnect_box.pack(side="left")
+
         row = self.setting_row(self.tr("startup"))
-        self.startup_var = tk.BooleanVar(value=startup_command() is not None)
-        ctk.CTkSwitch(
-            row, text=self.tr("startup_on"), variable=self.startup_var, font=self.font,
-            command=lambda: set_startup(self.startup_var.get()), width=WIDTH - LABEL,
-            height=30, text_color=TEXT, fg_color=FAINT, progress_color=GREEN,
-            button_color=KNOB, button_hover_color=KNOB,
+        self.switch(
+            row, self.tr("startup_on"), startup_command() is not None, set_startup
         ).pack(side="left")
 
         row = self.setting_row(self.tr("version"))
@@ -441,6 +450,16 @@ class App:
             dropdown_font=self.font, fg_color=FIELD, button_color=FIELD,
             button_hover_color=FIELD_HOVER, text_color=TEXT, text_color_disabled=MUTED,
             dropdown_fg_color=SELECTED, dropdown_hover_color=FIELD, dropdown_text_color=TEXT,
+        )
+
+    def switch(self, parent, text, value, command):
+        """An on/off switch that hands its new state to command."""
+        var = tk.BooleanVar(value=value)
+        return ctk.CTkSwitch(
+            parent, text=text, variable=var, command=lambda: command(var.get()),
+            width=WIDTH - LABEL, height=30, font=self.font, text_color=TEXT,
+            text_color_disabled=MUTED, fg_color=FAINT, progress_color=GREEN,
+            button_color=KNOB, button_hover_color=KNOB,
         )
 
     def setting_row(self, text):
@@ -526,7 +545,8 @@ class App:
     def set_controls(self, enabled: bool):
         state = "normal" if enabled else "disabled"
         for widget in [*self.role_boxes.values(), self.source_box, self.buffer_box,
-                       self.mode_box, self.language_box, self.scan_button]:
+                       self.reconnect_box, self.mode_box, self.language_box,
+                       self.scan_button]:
             widget.configure(state=state)
         # The volume belongs to the stream: live while streaming, dimmed otherwise
         self.volume_scale.configure(
@@ -547,6 +567,7 @@ class App:
             "mode": self.mode,
             "source": self.sources[self.source_index][0],
             "buffer": self.buffer,
+            "reconnect": self.reconnect,
             "roles": roles,
         }
 
@@ -564,6 +585,9 @@ class App:
 
     def set_buffer(self, label):
         self.buffer = BUFFERS[self.buffer_labels.index(label)]
+
+    def set_reconnect(self, enabled):
+        self.reconnect = enabled
 
     def set_language(self, label):
         self.remember()
@@ -685,7 +709,9 @@ class App:
         self.set_status("connecting")
         for dot in self.role_dots.values():
             dot.configure(text_color=AMBER)
-        future = self.engine.start(confs, self.mode, source_id, channels, self.buffer)
+        future = self.engine.start(
+            confs, self.mode, source_id, channels, self.buffer, self.reconnect
+        )
         self.pending.append((future, self.started))
 
     def started(self, _, error):

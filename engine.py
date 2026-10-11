@@ -551,6 +551,7 @@ class Engine:
         self.testing = False  # a stream that exists only to play a test sound
         self.start_ts = self.head = 0  # the shared timeline: its origin, and what is sent
         self.volume = None  # percent, once it has been set for this stream
+        self.reconnect = True
         self._task = None
         self._rejoins = {}  # output index -> task reconnecting that receiver
 
@@ -569,12 +570,16 @@ class Engine:
         """Future resolving to AirPlay audio receivers on the network."""
         return self._submit(self._scan(timeout))
 
-    def start(self, confs, mode: str, source_id: str, src_channels: int, buffer_ms=None):
+    def start(self, confs, mode: str, source_id: str, src_channels: int, buffer_ms=None,
+              reconnect: bool = True):
         """Start streaming. confs are ordered like MODES[mode].
 
-        buffer_ms is the network buffer; None lets the engine tune it.
+        buffer_ms is the network buffer; None lets the engine tune it. Without
+        reconnect the stream ends as soon as one receiver is lost.
         """
-        return self._submit(self._start(confs, mode, source_id, src_channels, buffer_ms))
+        return self._submit(
+            self._start(confs, mode, source_id, src_channels, buffer_ms, reconnect)
+        )
 
     def stop(self):
         return self._submit(self._stop())
@@ -619,10 +624,11 @@ class Engine:
         confs = [c for c in confs if c.get_service(Protocol.RAOP)]
         return sorted(confs, key=lambda c: c.name)
 
-    async def _start(self, confs, mode, source_id, src_channels, buffer_ms):
+    async def _start(self, confs, mode, source_id, src_channels, buffer_ms, reconnect):
         if self.state != "idle":
             raise RuntimeError("already running")
         self.state, self.error = "connecting", None
+        self.reconnect = reconnect
         self.underruns = 0
         self.volume = None
         self.timing.requests.clear()
@@ -687,7 +693,7 @@ class Engine:
         self.testing = True
         try:
             # A stream without a source: silence plus the test sound
-            await self._start([conf], "mono", None, 2, TEST_BUFFER_MS)
+            await self._start([conf], "mono", None, 2, TEST_BUFFER_MS, False)
             await asyncio.sleep(TEST_LEAD)
             tone = chime()
             self.inject[0] = tone
@@ -895,10 +901,12 @@ class Engine:
                         for index, out in enumerate(outputs):
                             if not out.online:
                                 continue
-                            if out.lost:
+                            if not out.lost:
+                                asyncio.ensure_future(self._feedback(out))
+                            elif self.reconnect:
                                 self._drop(index)
                             else:
-                                asyncio.ensure_future(self._feedback(out))
+                                raise ConnectionError("disconnected", out.name)
                         if self.capture and self.capture.error:
                             raise RuntimeError("capture", str(self.capture.error))
 
@@ -906,7 +914,7 @@ class Engine:
         except asyncio.CancelledError:
             raise
         except Exception as ex:  # pylint: disable=broad-except
-            known = len(ex.args) == 2 and ex.args[0] == "capture"
+            known = len(ex.args) == 2 and ex.args[0] in ("disconnected", "capture")
             self.error = tuple(ex.args) if known else ("error", str(ex) or type(ex).__name__)
             self._task = None
             await self._stop()

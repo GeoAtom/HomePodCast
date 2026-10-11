@@ -1,0 +1,58 @@
+# Builds HomePodCast.exe on every push. A tag v<VERSION> also drafts the release
+# with the exe attached; publishing the draft is done by hand.
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: .\build.ps1
+
+      - name: Check the version in the exe
+        run: |
+          $version = (Get-Item dist\HomePodCast.exe).VersionInfo.ProductVersion
+          "Built HomePod Cast $version"
+          if (-not $version) { throw "The exe carries no version" }
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match VERSION $version in app.py"
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: HomePodCast
+          path: dist/HomePodCast.exe
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: HomePodCast
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" HomePodCast.exe --draft --verify-tag --title "HomePod Cast $TAG" --generate-notes

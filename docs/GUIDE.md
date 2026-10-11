@@ -1,6 +1,6 @@
 # HomePod Cast — Guide · 使用须知
 
-[← Back to README](../README.md) · [English](#english) · [中文](#中文) · [Build from source](#build-from-source)
+[← Back to README](../README.md) · [English](#english) · [中文](#中文) · [Privacy · 隐私](#privacy--隐私) · [Build from source](#build-from-source)
 
 ---
 
@@ -40,6 +40,14 @@
 
 ---
 
+## Privacy · 隐私
+
+HomePod Cast collects nothing and has no account, analytics or telemetry. Your audio goes only to the speakers you pick, on your own network. The one connection it makes beyond that is a request to `api.github.com` at launch, to look up the number of the latest release; like any web request it shows GitHub your IP address.
+
+HomePod Cast 不收集任何数据，没有账号、统计或遥测。音频只发送到你在局域网里选中的音箱。除此之外，它只在启动时向 `api.github.com` 发一次请求，查询最新版本号；和任何网络请求一样，GitHub 会看到你的 IP 地址。
+
+---
+
 ## Build from source
 
 Windows 10/11, Python 3.12.
@@ -52,7 +60,7 @@ python app.py     # run
 
 `engine.py` captures, routes and streams; `app.py` is the window. `--autostart` starts streaming with the last setup, `--minimized` starts minimised.
 
-To release, set `VERSION` in `app.py` and tag the commit `v` + that version; the build stamps it into the exe.
+Releases are built by [GitHub Actions](../.github/workflows/build.yml), not on a developer's machine: set `VERSION` in `app.py`, push, then push the tag `v` + that version. The workflow builds the exe, stamps the version into it and attaches it to a draft release.
 
 ## Credits
 

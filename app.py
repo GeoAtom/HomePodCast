@@ -15,9 +15,10 @@ import winreg
 import customtkinter as ctk
 
 import engine as eng
+import tray
 
 APP_NAME = "HomePod Cast"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", "."), "HomePodCast", "config.json")
 RELEASES = "https://github.com/GeoAtom/HomePodCast/releases/latest"
 LATEST_API = "https://api.github.com/repos/GeoAtom/HomePodCast/releases/latest"
@@ -74,6 +75,8 @@ STRINGS = {
         "buffer": "缓冲",
         "auto": "自动",
         "language": "语言",
+        "mute": "静音",
+        "mute_on": "串流时让电脑扬声器静音",
         "dropout": "断线",
         "dropout_on": "自动重连掉线的音箱",
         "startup": "自启",
@@ -81,6 +84,9 @@ STRINGS = {
         "version": "版本",
         "update": "{current}  →  下载 {latest}",
         "update_hint": "有新版本 {latest}",
+        "tray_show": "显示窗口",
+        "tray_quit": "退出",
+        "tray_hint": "窗口收到了这里，程序还在运行。右键点图标可以退出。",
         "scanning": "正在扫描局域网…",
         "found": "找到 {count} 台 AirPlay 音箱",
         "none_found": "没有找到 AirPlay 音箱",
@@ -125,6 +131,8 @@ STRINGS = {
         "buffer": "Buffer",
         "auto": "Auto",
         "language": "Language",
+        "mute": "Mute",
+        "mute_on": "Mute this PC while streaming",
         "dropout": "Dropout",
         "dropout_on": "Reconnect speakers that drop out",
         "startup": "Startup",
@@ -132,6 +140,10 @@ STRINGS = {
         "version": "Version",
         "update": "{current}  →  get {latest}",
         "update_hint": "Version {latest} is out",
+        "tray_show": "Show window",
+        "tray_quit": "Quit",
+        "tray_hint": "The window went here and the app keeps running. Right-click the "
+        "icon to quit.",
         "scanning": "Scanning the network…",
         "found": "Found {count} AirPlay speaker(s)",
         "none_found": "No AirPlay speakers found",
@@ -271,17 +283,20 @@ class App:
         ctk.set_appearance_mode("system")
         self.root = root = ctk.CTk(fg_color=SURFACE)
         root.title(APP_NAME)
+        # The built exe carries the icon itself; from source it sits next to us
+        icon = (
+            sys.executable if getattr(sys, "frozen", False)
+            else os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        )
         try:
-            # The built exe carries the icon itself; from source it sits next to us
-            frozen = getattr(sys, "frozen", False)
-            root.iconbitmap(
-                sys.executable if frozen
-                else os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-            )
+            root.iconbitmap(icon)
         except tk.TclError:
             pass
         root.resizable(False, False)
-        root.protocol("WM_DELETE_WINDOW", self.quit)
+        # Closing the window only hides it: the way out is in the tray icon's menu
+        root.protocol("WM_DELETE_WINDOW", self.hide)
+        self.tray = tray.Tray(APP_NAME, icon, self.stop_now)
+        self.hinted = self.config.get("hinted") is True  # told where the window went
 
         self.mode = self.config.get("mode", "mono")
         if self.mode not in eng.MODES:
@@ -292,14 +307,13 @@ class App:
         saved_buffer = self.config.get("buffer")
         self.buffer = saved_buffer if saved_buffer in BUFFERS else None
         self.reconnect = self.config.get("reconnect") is not False
+        self.mute = self.config.get("mute") is not False
         self.volume = tk.DoubleVar(value=30)
         self.status_text = ("scanning", {}, "")
         self.body = None
         self.build()
         if "--minimized" in sys.argv:
-            # Once the main loop runs: customtkinter leaves a window hidden for good
-            # that is minimised before it has been shown
-            root.after(0, root.iconify)
+            root.withdraw()  # only the tray icon shows
         self.scan()
         self.pending.append((in_background(newer_version), self.checked))
         self.tick()
@@ -407,6 +421,10 @@ class App:
         self.language_box.set(LANGUAGES[self.lang])
         self.language_box.pack(side="left")
 
+        row = self.setting_row(self.tr("mute"))
+        self.mute_box = self.switch(row, self.tr("mute_on"), self.mute, self.set_mute)
+        self.mute_box.pack(side="left")
+
         row = self.setting_row(self.tr("dropout"))
         self.reconnect_box = self.switch(
             row, self.tr("dropout_on"), self.reconnect, self.set_reconnect
@@ -426,6 +444,7 @@ class App:
         self.version_button.pack(side="left")
         self.show_version()
 
+        self.tray.labels = (self.tr("tray_show"), self.tr("tray_quit"))
         self.build_roles()
         self.place_settings()
         self.set_status(*self.status_text)
@@ -545,8 +564,8 @@ class App:
     def set_controls(self, enabled: bool):
         state = "normal" if enabled else "disabled"
         for widget in [*self.role_boxes.values(), self.source_box, self.buffer_box,
-                       self.reconnect_box, self.mode_box, self.language_box,
-                       self.scan_button]:
+                       self.mute_box, self.reconnect_box, self.mode_box,
+                       self.language_box, self.scan_button]:
             widget.configure(state=state)
         # The volume belongs to the stream: live while streaming, dimmed otherwise
         self.volume_scale.configure(
@@ -567,8 +586,10 @@ class App:
             "mode": self.mode,
             "source": self.sources[self.source_index][0],
             "buffer": self.buffer,
+            "mute": self.mute,
             "reconnect": self.reconnect,
             "roles": roles,
+            "hinted": self.hinted,
         }
 
     # --- choices ----------------------------------------------------------------
@@ -585,6 +606,9 @@ class App:
 
     def set_buffer(self, label):
         self.buffer = BUFFERS[self.buffer_labels.index(label)]
+
+    def set_mute(self, enabled):
+        self.mute = enabled
 
     def set_reconnect(self, enabled):
         self.reconnect = enabled
@@ -710,7 +734,7 @@ class App:
         for dot in self.role_dots.values():
             dot.configure(text_color=AMBER)
         future = self.engine.start(
-            confs, self.mode, source_id, channels, self.buffer, self.reconnect
+            confs, self.mode, source_id, channels, self.buffer, self.reconnect, self.mute
         )
         self.pending.append((future, self.started))
 
@@ -755,16 +779,41 @@ class App:
         if len(outputs) > 1:
             self.apply_volume()
 
-    def quit(self):
+    def hide(self):
+        """Put the window away; the tray icon brings it back."""
+        self.root.withdraw()
+        if not self.hinted:
+            self.hinted = True
+            self.remember()
+            save_config(self.config)
+            self.tray.notify(APP_NAME, self.tr("tray_hint"))
+
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def stop_now(self):
+        """End the stream and wait for it, so the PC is not left muted."""
         try:
             self.engine.stop().result(3)
         except Exception:  # pylint: disable=broad-except
             pass
+
+    def quit(self):
+        self.stop_now()
+        self.tray.close()
         self.root.destroy()
 
     # --- periodic update --------------------------------------------------------
 
     def tick(self):
+        while not self.tray.clicks.empty():
+            if self.tray.clicks.get() == "quit":
+                self.quit()
+                return
+            self.show()
+
         for item in [p for p in self.pending if p[0].done()]:
             self.pending.remove(item)
             future, callback = item
@@ -811,4 +860,6 @@ class App:
 
 
 if __name__ == "__main__":
-    App().run()
+    # A second copy would fight the first over the speakers: show that one instead
+    if not tray.show_running():
+        App().run()

@@ -20,7 +20,6 @@ import socket
 import struct
 import threading
 import time
-from uuid import UUID
 import warnings
 
 import numpy as np
@@ -80,12 +79,6 @@ MODES = {
     "stereo": ["L", "R"],
     "quad": ["FL", "FR", "RL", "RR"],
 }
-
-# Core Audio, as far as muting an output device takes
-DEVICE_ENUMERATOR = "BCDE0395-E52F-467C-8E3D-C4579291692E"
-IMM_DEVICE_ENUMERATOR = "A95664D2-9614-4F35-A746-DE8DB63617E6"
-AUDIO_ENDPOINT_VOLUME = "5CDF2C82-841E-4546-9722-0CF74078229A"
-HARDWARE_MUTE = 2  # the device mutes itself, after the point where loopback listens
 
 TEST_BUFFER_MS = 100  # network buffer while only a test sound is played
 TEST_LEAD = 1.0  # seconds of silence first, so the receiver has synced its clock
@@ -294,52 +287,6 @@ class Capture(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
-
-
-def com_call(this, index: int, *args) -> int:
-    """Call the method at index in the vtable of a COM interface."""
-    vtable = ctypes.cast(this, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
-    kinds = [ctypes.c_void_p] * (len(args) + 1)
-    result = ctypes.WINFUNCTYPE(ctypes.c_long, *kinds)(vtable[index])(this, *args)
-    if result < 0:
-        raise OSError(f"COM error {result & MASK32:#010x}")
-    return result
-
-
-def mute_device(device_id: str, muted: bool) -> bool:
-    """Mute or unmute an output device; True if that changed it.
-
-    Only a device that mutes itself is touched. What Windows silences on behalf of
-    a device that cannot is silent in the loopback capture too.
-    """
-
-    def guid(text):
-        return (ctypes.c_byte * 16).from_buffer_copy(UUID(text).bytes_le)
-
-    enumerator, device, volume = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-    support, state = ctypes.c_uint32(), ctypes.c_int32()
-    try:
-        if ctypes.windll.ole32.CoCreateInstance(
-            guid(DEVICE_ENUMERATOR), None, 23, guid(IMM_DEVICE_ENUMERATOR),
-            ctypes.byref(enumerator),
-        ) < 0:
-            return False
-        com_call(enumerator, 5, device_id, ctypes.byref(device))  # GetDevice
-        com_call(  # Activate
-            device, 3, guid(AUDIO_ENDPOINT_VOLUME), 23, None, ctypes.byref(volume)
-        )
-        com_call(volume, 19, ctypes.byref(support))  # QueryHardwareSupport
-        com_call(volume, 15, ctypes.byref(state))  # GetMute
-        if not support.value & HARDWARE_MUTE or bool(state.value) == muted:
-            return False
-        com_call(volume, 14, int(muted), None)  # SetMute
-        return True
-    except OSError:
-        return False
-    finally:
-        for interface in (volume, device, enumerator):
-            if interface:
-                com_call(interface, 2)  # Release
 
 
 def routing_matrix(mode: str, src: int) -> np.ndarray:
@@ -605,14 +552,12 @@ class Engine:
         self.start_ts = self.head = 0  # the shared timeline: its origin, and what is sent
         self.volume = None  # percent, once it has been set for this stream
         self.reconnect = True
-        self.muted = None  # id of the source device, while we keep it muted
         self._task = None
         self._rejoins = {}  # output index -> task reconnecting that receiver
 
     def _run_loop(self):
         # Default Windows timer granularity (15.6 ms) is coarser than one packet
         ctypes.windll.winmm.timeBeginPeriod(1)
-        ctypes.windll.ole32.CoInitializeEx(None, 0)  # for mute_device
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
@@ -626,15 +571,14 @@ class Engine:
         return self._submit(self._scan(timeout))
 
     def start(self, confs, mode: str, source_id: str, src_channels: int, buffer_ms=None,
-              reconnect: bool = True, mute: bool = False):
+              reconnect: bool = True):
         """Start streaming. confs are ordered like MODES[mode].
 
         buffer_ms is the network buffer; None lets the engine tune it. Without
-        reconnect the stream ends as soon as one receiver is lost. mute silences
-        the source device itself for as long as the stream lasts.
+        reconnect the stream ends as soon as one receiver is lost.
         """
         return self._submit(
-            self._start(confs, mode, source_id, src_channels, buffer_ms, reconnect, mute)
+            self._start(confs, mode, source_id, src_channels, buffer_ms, reconnect)
         )
 
     def stop(self):
@@ -680,8 +624,7 @@ class Engine:
         confs = [c for c in confs if c.get_service(Protocol.RAOP)]
         return sorted(confs, key=lambda c: c.name)
 
-    async def _start(self, confs, mode, source_id, src_channels, buffer_ms, reconnect,
-                     mute=False):
+    async def _start(self, confs, mode, source_id, src_channels, buffer_ms, reconnect):
         if self.state != "idle":
             raise RuntimeError("already running")
         self.state, self.error = "connecting", None
@@ -709,8 +652,6 @@ class Engine:
         if source_id is not None:
             self.capture = Capture(source_id, src_channels)
             self.capture.start()
-            if mute and mute_device(source_id, True):
-                self.muted = source_id
         self.pinger = Pinger([o.address for o in self.outputs])
         self.pinger.start()
         self.started_at = time.monotonic()
@@ -731,9 +672,6 @@ class Engine:
         if self.capture:
             self.capture.stop()
             self.capture = None
-        if self.muted:
-            mute_device(self.muted, False)
-            self.muted = None
         if self.pinger:
             self.pinger.stop()
             self.pinger = None

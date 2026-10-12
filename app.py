@@ -2,11 +2,14 @@
 
 from concurrent.futures import Future
 import ctypes
+import hashlib
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.request
 import webbrowser
@@ -18,9 +21,10 @@ import engine as eng
 import tray
 
 APP_NAME = "HomePod Cast"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", "."), "HomePodCast", "config.json")
 RELEASES = "https://github.com/GeoAtom/HomePodCast/releases/latest"
+DOWNLOADS = "https://github.com/GeoAtom/HomePodCast/releases/download/"
 LATEST_API = "https://api.github.com/repos/GeoAtom/HomePodCast/releases/latest"
 
 # Where Windows keeps the programs it starts at sign-in
@@ -75,14 +79,15 @@ STRINGS = {
         "buffer": "缓冲",
         "auto": "自动",
         "language": "语言",
-        "mute": "静音",
-        "mute_on": "串流时让电脑扬声器静音",
         "dropout": "断线",
         "dropout_on": "自动重连掉线的音箱",
         "startup": "自启",
         "startup_on": "登录 Windows 后自动串流",
         "version": "版本",
-        "update": "{current}  →  下载 {latest}",
+        "checking": "正在检查…",
+        "up_to_date": "已是最新版本",
+        "check_failed": "检查失败",
+        "downloading": "正在下载 {percent}%",
         "update_hint": "有新版本 {latest}",
         "tray_show": "显示窗口",
         "tray_quit": "退出",
@@ -131,14 +136,15 @@ STRINGS = {
         "buffer": "Buffer",
         "auto": "Auto",
         "language": "Language",
-        "mute": "Mute",
-        "mute_on": "Mute this PC while streaming",
         "dropout": "Dropout",
         "dropout_on": "Reconnect speakers that drop out",
         "startup": "Startup",
         "startup_on": "Stream when I sign in to Windows",
         "version": "Version",
-        "update": "{current}  →  get {latest}",
+        "checking": "Checking…",
+        "up_to_date": "Up to date",
+        "check_failed": "Could not check",
+        "downloading": "Downloading {percent}%",
         "update_hint": "Version {latest} is out",
         "tray_show": "Show window",
         "tray_quit": "Quit",
@@ -230,8 +236,11 @@ def set_startup(enabled: bool):
         pass
 
 
-def newer_version():
-    """Version of the latest release on GitHub if it is newer than this one."""
+def newer_release():
+    """The latest release on GitHub if it is newer than this program, or None.
+
+    A dict of its version and of where its exe is, how big, and its SHA-256.
+    """
 
     def numbers(version):
         return tuple(int(part) for part in version.split("."))
@@ -240,8 +249,62 @@ def newer_version():
         LATEST_API, headers={"User-Agent": f"HomePodCast/{VERSION}"}
     )
     with urllib.request.urlopen(request, timeout=5) as reply:
-        latest = json.load(reply)["tag_name"].lstrip("v")
-    return latest if numbers(latest) > numbers(VERSION) else None
+        release = json.load(reply)
+    latest = release["tag_name"].lstrip("v")
+    if numbers(latest) <= numbers(VERSION):
+        return None
+    exe = next(
+        (a for a in release.get("assets", []) if a["name"].lower().endswith(".exe")), {}
+    )
+    return {
+        "version": latest,
+        "url": exe.get("browser_download_url", ""),
+        "size": exe.get("size"),
+        "digest": exe.get("digest"),
+    }
+
+
+def install(release: dict, progress):
+    """Put the exe of that release in the place of the one that is running.
+
+    Windows does not let a running exe be overwritten, but it lets it be renamed:
+    it stays next to the new one as .old, for the next start to remove. progress is
+    told how far the download is, from 0 to 1.
+    """
+    if not release["url"].startswith(DOWNLOADS):
+        raise ValueError("not a release of ours")
+    target = sys.executable
+    fresh, old = target + ".new", target + ".old"
+    request = urllib.request.Request(
+        release["url"], headers={"User-Agent": f"HomePodCast/{VERSION}"}
+    )
+    digest, size = hashlib.sha256(), 0
+    with urllib.request.urlopen(request, timeout=30) as reply, open(fresh, "wb") as file:
+        while block := reply.read(1 << 16):
+            file.write(block)
+            digest.update(block)
+            size += len(block)
+            progress(size / (release["size"] or size))
+    if size != release["size"] or release["digest"] not in (
+        None, "sha256:" + digest.hexdigest()
+    ):
+        os.remove(fresh)
+        raise ValueError("the download is damaged")
+    if os.path.exists(old):
+        os.remove(old)
+    os.rename(target, old)
+    os.rename(fresh, target)
+
+
+def tidy_up():
+    """Remove the exe an update has replaced, once the old program has let go of it."""
+    for _ in range(10):
+        try:
+            os.remove(sys.executable + ".old")
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(1)
 
 
 def in_background(function) -> Future:
@@ -273,7 +336,12 @@ class App:
         self.testing = 0  # test sounds being played while not streaming
         self.volume_synced = False
         self.show_settings = False
-        self.update = None  # version of a newer release
+        self.update = None  # a newer release, see newer_release
+        self.checking = False  # asking GitHub for one
+        self.asked = False  # the question came from a click, so it gets an answer
+        self.version_note = None  # what is shown next to the version for a moment
+        self.progress = None  # how far the download of the update is, 0 to 1
+        self.replaced = False  # the update is in our place and waits to be started
         # --autostart: begin streaming with the saved setup once devices are found.
         # Counts the scans that may still be spent on finding them.
         self.autostart = AUTOSTART_SCANS if "--autostart" in sys.argv else 0
@@ -307,15 +375,22 @@ class App:
         saved_buffer = self.config.get("buffer")
         self.buffer = saved_buffer if saved_buffer in BUFFERS else None
         self.reconnect = self.config.get("reconnect") is not False
-        self.mute = self.config.get("mute") is not False
         self.volume = tk.DoubleVar(value=30)
         self.status_text = ("scanning", {}, "")
         self.body = None
+        first_run = not self.config
+        if first_run:
+            set_startup(True)  # the default, from then on the switch decides
         self.build()
+        if first_run:
+            self.remember()
+            save_config(self.config)  # there is a first run only once
         if "--minimized" in sys.argv:
             root.withdraw()  # only the tray icon shows
         self.scan()
-        self.pending.append((in_background(newer_version), self.checked))
+        if getattr(sys, "frozen", False):
+            in_background(tidy_up)
+        self.check(asked=False)
         self.tick()
 
     def tr(self, key: str, **values) -> str:
@@ -421,10 +496,6 @@ class App:
         self.language_box.set(LANGUAGES[self.lang])
         self.language_box.pack(side="left")
 
-        row = self.setting_row(self.tr("mute"))
-        self.mute_box = self.switch(row, self.tr("mute_on"), self.mute, self.set_mute)
-        self.mute_box.pack(side="left")
-
         row = self.setting_row(self.tr("dropout"))
         self.reconnect_box = self.switch(
             row, self.tr("dropout_on"), self.reconnect, self.set_reconnect
@@ -437,11 +508,20 @@ class App:
         ).pack(side="left")
 
         row = self.setting_row(self.tr("version"))
+        holder = ctk.CTkFrame(row, width=WIDTH - LABEL, height=26, fg_color="transparent")
+        holder.pack_propagate(False)
+        holder.pack(side="left")
+        # The version asks GitHub for a newer one; the arrow next to it installs that
         self.version_button = ctk.CTkButton(
-            row, command=self.open_release, width=WIDTH - LABEL, height=26, anchor="w",
-            font=self.font, fg_color="transparent",
+            holder, command=self.check, width=0, height=26, anchor="w", font=self.font,
+            fg_color="transparent", hover_color=FIELD, text_color=MUTED, cursor="hand2",
         )
         self.version_button.pack(side="left")
+        self.update_button = ctk.CTkButton(
+            holder, command=self.get_update, width=0, height=26, anchor="w",
+            font=self.font, fg_color="transparent", hover_color=FIELD, text_color=LINK,
+            cursor="hand2",
+        )
         self.show_version()
 
         self.tray.labels = (self.tr("tray_show"), self.tr("tray_quit"))
@@ -525,19 +605,26 @@ class App:
             self.role_vars["mono"].set(labels[0])
 
     def show_version(self):
-        if self.update:
-            self.version_button.configure(
-                text=self.tr("update", current=VERSION, latest=self.update),
-                text_color=LINK, hover_color=FIELD, cursor="hand2",
-            )
+        note = "checking" if self.checking and self.asked else self.version_note
+        self.version_button.configure(
+            text=f"{VERSION}    {self.tr(note)}" if note else VERSION
+        )
+        if self.progress is not None:
+            text = self.tr("downloading", percent=int(self.progress * 100))
+        elif self.update:
+            text = f"→  {self.update['version']}"
         else:
-            self.version_button.configure(
-                text=VERSION, text_color=MUTED, hover_color=SURFACE, cursor="",
-            )
+            self.update_button.pack_forget()
+            return
+        self.update_button.configure(text=text)
+        self.update_button.pack(side="left")
 
     def place_settings(self):
         arrow = "▴" if self.show_settings else "▾"
-        hint = f"    {self.tr('update_hint', latest=self.update)}" if self.update else ""
+        hint = (
+            f"    {self.tr('update_hint', latest=self.update['version'])}"
+            if self.update else ""
+        )
         self.settings_button.configure(text=f"{self.tr('settings')}  {arrow}{hint}")
         if self.show_settings:
             self.settings.pack(pady=(2, 0))
@@ -564,9 +651,14 @@ class App:
     def set_controls(self, enabled: bool):
         state = "normal" if enabled else "disabled"
         for widget in [*self.role_boxes.values(), self.source_box, self.buffer_box,
-                       self.mute_box, self.reconnect_box, self.mode_box,
-                       self.language_box, self.scan_button]:
+                       self.reconnect_box, self.mode_box, self.language_box,
+                       self.scan_button]:
             widget.configure(state=state)
+        # A switch keeps its colours when it is locked: grey says it cannot be flipped
+        self.reconnect_box.configure(
+            progress_color=GREEN if enabled else MUTED,
+            button_color=KNOB if enabled else FIELD,
+        )
         # The volume belongs to the stream: live while streaming, dimmed otherwise
         self.volume_scale.configure(
             state="disabled" if enabled else "normal",
@@ -586,7 +678,6 @@ class App:
             "mode": self.mode,
             "source": self.sources[self.source_index][0],
             "buffer": self.buffer,
-            "mute": self.mute,
             "reconnect": self.reconnect,
             "roles": roles,
             "hinted": self.hinted,
@@ -606,9 +697,6 @@ class App:
 
     def set_buffer(self, label):
         self.buffer = BUFFERS[self.buffer_labels.index(label)]
-
-    def set_mute(self, enabled):
-        self.mute = enabled
 
     def set_reconnect(self, enabled):
         self.reconnect = enabled
@@ -667,14 +755,66 @@ class App:
         if self.autostart and not self.running and not self.testing:
             self.scan()
 
-    def checked(self, version, error):
-        self.update = None if error else version
+    def check(self, asked=True):
+        """Ask GitHub for a newer release. A click on the version is told the answer."""
+        if self.checking or self.progress is not None:
+            return
+        self.checking, self.asked, self.version_note = True, asked, None
+        self.show_version()
+        self.pending.append((in_background(newer_release), self.checked))
+
+    def checked(self, release, error):
+        self.checking = False
+        if not error:
+            self.update = release
+        if self.asked and (error or not release):
+            self.version_note = note = "check_failed" if error else "up_to_date"
+            self.root.after(4000, lambda: self.forget_note(note))
         self.show_version()
         self.place_settings()
 
-    def open_release(self):
-        if self.update:
+    def forget_note(self, note):
+        if self.version_note == note:
+            self.version_note = None
+            self.show_version()
+
+    def get_update(self):
+        """Download the newer release, put it in our place and start it."""
+        if self.progress is not None:
+            return
+        if not getattr(sys, "frozen", False) or not self.update["url"]:
+            webbrowser.open(RELEASES)  # run from source: there is no exe to replace
+            return
+        self.progress = 0.0
+        self.show_version()
+        release = self.update
+        self.pending.append(
+            (in_background(lambda: install(release, self.downloaded)), self.installed)
+        )
+
+    def downloaded(self, part):
+        self.progress = part  # shown by tick: this is the download's thread
+
+    def installed(self, _, error):
+        self.progress = None
+        if error:
+            # The folder may not be ours to write to: the browser can still get it
+            self.show_version()
             webbrowser.open(RELEASES)
+        else:
+            self.replaced = True  # tick starts it
+
+    def restart(self):
+        """Hand over to the exe that has taken our place."""
+        resume = ["--autostart"] if self.running else []
+        self.stop_now()
+        self.tray.close()  # or the new copy would take us for a running one
+        # A PyInstaller exe that starts itself is taken for its own child otherwise
+        subprocess.Popen(
+            [sys.executable, *resume],
+            env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"),
+        )
+        self.root.destroy()
 
     def test(self, role):
         """Play a test sound on the speaker picked for this channel."""
@@ -734,7 +874,7 @@ class App:
         for dot in self.role_dots.values():
             dot.configure(text_color=AMBER)
         future = self.engine.start(
-            confs, self.mode, source_id, channels, self.buffer, self.reconnect, self.mute
+            confs, self.mode, source_id, channels, self.buffer, self.reconnect
         )
         self.pending.append((future, self.started))
 
@@ -794,7 +934,7 @@ class App:
         self.root.focus_force()
 
     def stop_now(self):
-        """End the stream and wait for it, so the PC is not left muted."""
+        """End the stream and wait for it, so the speakers are let go."""
         try:
             self.engine.stop().result(3)
         except Exception:  # pylint: disable=broad-except
@@ -819,6 +959,12 @@ class App:
             future, callback = item
             error = future.exception()
             callback(None if error else future.result(), error)
+
+        if self.replaced:
+            self.restart()
+            return
+        if self.progress is not None:
+            self.show_version()
 
         st = self.engine.status()
         if self.streaming and st["state"] == "streaming":

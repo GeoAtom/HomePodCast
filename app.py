@@ -21,7 +21,7 @@ import engine as eng
 import tray
 
 APP_NAME = "HomePod Cast"
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", "."), "HomePodCast", "config.json")
 RELEASES = "https://github.com/GeoAtom/HomePodCast/releases/latest"
 DOWNLOADS = "https://github.com/GeoAtom/HomePodCast/releases/download/"

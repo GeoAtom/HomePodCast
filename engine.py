@@ -28,7 +28,6 @@ from pyatv.const import Protocol
 from pyatv.protocols.airplay.auth import extract_credentials
 from pyatv.protocols.airplay.utils import (
     AirPlayMajorVersion,
-    dbfs_to_pct,
     get_protocol_version,
     pct_to_dbfs,
 )
@@ -72,6 +71,7 @@ RETRY_MAX_S = 300.0
 SETTLED_S = 30.0  # a connection that lasted this long was a good one
 SILENT_S = 10.0  # no answer on the RTSP connection for this long: gone
 CONNECT_TIMEOUT_S = 10.0
+VOLUME_GAP_S = 0.05  # at least this long between volume changes sent to the receivers
 SESSION_ACTIVE = 0x20000  # statusFlags bit: the receiver has an AirPlay session
 
 MODES = {
@@ -250,13 +250,42 @@ class Ring:
             self.n -= k
 
 
+def soundcard():
+    """The SoundCard module, with room for a whole PROPVARIANT.
+
+    SoundCard allocates 16 bytes for one, but Windows writes 24 when the property
+    is a blob, as the format of a device is. That runs past the block: a plain
+    process gets away with it, a Microsoft Store package is ended for it.
+    """
+    import soundcard as sc
+    from soundcard import mediafoundation as mf
+
+    def allocate(self):
+        self.ptr = mf._ffi.cast("PROPVARIANT *", mf._ole32.CoTaskMemAlloc(24))
+
+    mf._PropVariant.__init__ = allocate
+    return sc
+
+
+def channels_of(speaker) -> int:
+    """How many channels an output device has; 2 if it does not say in a way we read.
+
+    SoundCard only takes a format described the long way (WAVEFORMATEXTENSIBLE)
+    and fails on any other, which some drivers give. Capture converts to the
+    channels asked for, so a guess still works.
+    """
+    try:
+        return speaker.channels
+    except Exception:  # pylint: disable=broad-except
+        return 2
+
+
 def list_sources():
     """Return (id, name, channels) of all output devices, default first."""
-    import soundcard as sc
-
+    sc = soundcard()
     default = sc.default_speaker()
     speakers = [default] + [s for s in sc.all_speakers() if s.id != default.id]
-    return [(s.id, s.name, s.channels) for s in speakers]
+    return [(s.id, s.name, channels_of(s)) for s in speakers]
 
 
 class Capture(threading.Thread):
@@ -273,8 +302,7 @@ class Capture(threading.Thread):
     def run(self):
         ctypes.windll.ole32.CoInitializeEx(None, 0)
         try:
-            import soundcard as sc
-
+            sc = soundcard()
             warnings.simplefilter("ignore", sc.SoundcardRuntimeWarning)
             mic = sc.get_microphone(self.source_id, include_loopback=True)
             with mic.recorder(RATE, channels=self.channels, blocksize=RATE // 100) as rec:
@@ -496,12 +524,6 @@ class Output:
             return True
         return self.heard is not None and time.monotonic() - self.heard > SILENT_S
 
-    @property
-    def volume(self):
-        """Volume reported by the receiver in percent, if known."""
-        level = self.info.get("initialVolume")
-        return dbfs_to_pct(level) if isinstance(level, float) else None
-
     async def set_volume(self, percent: float):
         await self.rtsp.set_parameter("volume", str(pct_to_dbfs(percent)))
 
@@ -551,6 +573,7 @@ class Engine:
         self.testing = False  # a stream that exists only to play a test sound
         self.start_ts = self.head = 0  # the shared timeline: its origin, and what is sent
         self.volume = None  # percent, once it has been set for this stream
+        self.volume_sending = False
         self.reconnect = True
         self._task = None
         self._rejoins = {}  # output index -> task reconnecting that receiver
@@ -611,7 +634,6 @@ class Engine:
                     "age": time.monotonic() - o.joined,
                     "timing": self.timing.requests.get(o.address, 0),
                     "resends": o.control.resends if o.control else 0,
-                    "volume": o.volume,
                 }
                 for o in self.outputs
             ],
@@ -708,8 +730,23 @@ class Engine:
         self.outputs = []
 
     async def _set_volume(self, percent):
+        """Have the receivers follow. A slider in motion asks far more often than they
+        can answer: what it asked in the meantime is replaced by where it is now."""
         self.volume = percent
-        await asyncio.gather(*(o.set_volume(percent) for o in self.outputs if o.online))
+        if self.volume_sending:
+            return
+        self.volume_sending = True
+        try:
+            sent = None
+            while self.volume not in (None, sent):
+                sent = self.volume
+                await asyncio.gather(
+                    *(o.set_volume(sent) for o in self.outputs if o.online),
+                    return_exceptions=True,  # one that is lost is dealt with elsewhere
+                )
+                await asyncio.sleep(VOLUME_GAP_S)
+        finally:
+            self.volume_sending = False
 
     def _drop(self, index):
         """Take a lost receiver out of the stream and start getting it back."""

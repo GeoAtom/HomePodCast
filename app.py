@@ -21,11 +21,13 @@ import engine as eng
 import tray
 
 APP_NAME = "HomePod Cast"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", "."), "HomePodCast", "config.json")
 RELEASES = "https://github.com/GeoAtom/HomePodCast/releases/latest"
 DOWNLOADS = "https://github.com/GeoAtom/HomePodCast/releases/download/"
 LATEST_API = "https://api.github.com/repos/GeoAtom/HomePodCast/releases/latest"
+
+DEFAULT_VOLUME = 80  # percent, until the user has picked one
 
 # Where Windows keeps the programs it starts at sign-in
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -321,6 +323,14 @@ def in_background(function) -> Future:
     return future
 
 
+class VolumeSlider(ctk.CTkSlider):
+    """A slider whose wheel, like its mouse, does nothing while it is disabled."""
+
+    def _mouse_scroll_event(self, event):
+        if self.cget("state") == "normal":
+            super()._mouse_scroll_event(event)
+
+
 class App:
     def __init__(self):
         self.config = load_config()
@@ -375,13 +385,19 @@ class App:
         saved_buffer = self.config.get("buffer")
         self.buffer = saved_buffer if saved_buffer in BUFFERS else None
         self.reconnect = self.config.get("reconnect") is not False
-        self.volume = tk.DoubleVar(value=30)
+        saved_volume = self.config.get("volume")
+        self.volume = tk.DoubleVar(
+            value=saved_volume if isinstance(saved_volume, (int, float))
+            and 0 <= saved_volume <= 100 else DEFAULT_VOLUME
+        )
+        self.volume_saving = None  # the save waiting for the slider to come to rest
         self.status_text = ("scanning", {}, "")
         self.body = None
         first_run = not self.config
         if first_run:
             set_startup(True)  # the default, from then on the switch decides
         self.build()
+        self.place()
         if first_run:
             self.remember()
             save_config(self.config)  # there is a first run only once
@@ -392,6 +408,19 @@ class App:
             in_background(tidy_up)
         self.check(asked=False)
         self.tick()
+
+    def place(self):
+        """Put the window where it opens: in the middle of the desktop."""
+        root = self.root
+        root.update_idletasks()
+        area = (ctypes.c_long * 4)()  # the desktop without the taskbar
+        ctypes.windll.user32.SystemParametersInfoW(0x30, 0, area, 0)  # SPI_GETWORKAREA
+        left, top, right, bottom = area
+        width = root.winfo_reqwidth()
+        height = root.winfo_reqheight() + ctypes.windll.user32.GetSystemMetrics(4)  # title
+        x = max(left, (left + right - width) // 2)
+        y = max(top, (top + bottom - height) // 2)
+        tk.Tk.wm_geometry(root, f"+{x}+{y}")  # CTk would scale a position it is given
 
     def tr(self, key: str, **values) -> str:
         return STRINGS[self.lang][key].format(**values)
@@ -431,13 +460,12 @@ class App:
         row = ctk.CTkFrame(body, fg_color="transparent")
         row.pack(pady=(8, 0))
         self.label(row, self.tr("volume")).pack(side="left")
-        self.volume_scale = ctk.CTkSlider(
+        self.volume_scale = VolumeSlider(
             row, from_=0, to=100, variable=self.volume, width=WIDTH - LABEL - 40, height=16,
             fg_color=FIELD, progress_color=MUTED, button_color=TEXT, button_hover_color=TEXT,
-            command=lambda _: self.show_volume(), state="disabled",
+            command=lambda _: self.move_volume(), state="disabled",
         )
         self.volume_scale.pack(side="left")
-        self.volume_scale.bind("<ButtonRelease-1>", lambda _: self.apply_volume())
         self.volume_text = ctk.CTkLabel(
             row, width=40, anchor="e", font=self.font, text_color=MUTED
         )
@@ -679,6 +707,7 @@ class App:
             "source": self.sources[self.source_index][0],
             "buffer": self.buffer,
             "reconnect": self.reconnect,
+            "volume": round(self.volume.get()),
             "roles": roles,
             "hinted": self.hinted,
         }
@@ -904,20 +933,21 @@ class App:
         for dot in self.role_dots.values():
             dot.configure(text_color=FAINT)
 
+    def move_volume(self):
+        self.show_volume()
+        self.apply_volume()
+        if self.volume_saving:
+            self.root.after_cancel(self.volume_saving)
+        self.volume_saving = self.root.after(1000, self.save_volume)
+
+    def save_volume(self):
+        self.volume_saving = None
+        self.config["volume"] = round(self.volume.get())
+        save_config(self.config)
+
     def apply_volume(self):
         if self.streaming:
             self.engine.set_volume(self.volume.get())
-
-    def sync_volume(self, outputs):
-        """Show the receivers' volume; level several receivers to the quietest one."""
-        self.volume_synced = True
-        volumes = [o["volume"] for o in outputs if o["volume"] is not None]
-        if not volumes:
-            return
-        self.volume.set(min(volumes))
-        self.show_volume()
-        if len(outputs) > 1:
-            self.apply_volume()
 
     def hide(self):
         """Put the window away; the tray icon brings it back."""
@@ -969,7 +999,8 @@ class App:
         st = self.engine.status()
         if self.streaming and st["state"] == "streaming":
             if not self.volume_synced:
-                self.sync_volume(st["outputs"])
+                self.volume_synced = True
+                self.apply_volume()  # a new stream plays at the slider's volume
             decibel = 20 * math.log10(max(st["level"], 1e-6))
             self.show_level(min(max(0.0, 1 + decibel / 60), 1.0))
 

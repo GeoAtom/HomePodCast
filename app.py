@@ -27,8 +27,6 @@ RELEASES = "https://github.com/GeoAtom/HomePodCast/releases/latest"
 DOWNLOADS = "https://github.com/GeoAtom/HomePodCast/releases/download/"
 LATEST_API = "https://api.github.com/repos/GeoAtom/HomePodCast/releases/latest"
 
-DEFAULT_VOLUME = 80  # percent, until the user has picked one
-
 # Where Windows keeps the programs it starts at sign-in
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "HomePodCast"
@@ -385,12 +383,7 @@ class App:
         saved_buffer = self.config.get("buffer")
         self.buffer = saved_buffer if saved_buffer in BUFFERS else None
         self.reconnect = self.config.get("reconnect") is not False
-        saved_volume = self.config.get("volume")
-        self.volume = tk.DoubleVar(
-            value=saved_volume if isinstance(saved_volume, (int, float))
-            and 0 <= saved_volume <= 100 else DEFAULT_VOLUME
-        )
-        self.volume_saving = None  # the save waiting for the slider to come to rest
+        self.volume = tk.DoubleVar(value=30)
         self.status_text = ("scanning", {}, "")
         self.body = None
         first_run = not self.config
@@ -707,7 +700,6 @@ class App:
             "source": self.sources[self.source_index][0],
             "buffer": self.buffer,
             "reconnect": self.reconnect,
-            "volume": round(self.volume.get()),
             "roles": roles,
             "hinted": self.hinted,
         }
@@ -936,18 +928,21 @@ class App:
     def move_volume(self):
         self.show_volume()
         self.apply_volume()
-        if self.volume_saving:
-            self.root.after_cancel(self.volume_saving)
-        self.volume_saving = self.root.after(1000, self.save_volume)
-
-    def save_volume(self):
-        self.volume_saving = None
-        self.config["volume"] = round(self.volume.get())
-        save_config(self.config)
 
     def apply_volume(self):
         if self.streaming:
             self.engine.set_volume(self.volume.get())
+
+    def sync_volume(self, outputs):
+        """Show the receivers' volume; level several receivers to the quietest one."""
+        self.volume_synced = True
+        volumes = [o["volume"] for o in outputs if o["volume"] is not None]
+        if not volumes:
+            return
+        self.volume.set(min(volumes))
+        self.show_volume()
+        if len(outputs) > 1:
+            self.apply_volume()
 
     def hide(self):
         """Put the window away; the tray icon brings it back."""
@@ -999,8 +994,7 @@ class App:
         st = self.engine.status()
         if self.streaming and st["state"] == "streaming":
             if not self.volume_synced:
-                self.volume_synced = True
-                self.apply_volume()  # a new stream plays at the slider's volume
+                self.sync_volume(st["outputs"])
             decibel = 20 * math.log10(max(st["level"], 1e-6))
             self.show_level(min(max(0.0, 1 + decibel / 60), 1.0))
 

@@ -28,6 +28,7 @@ from pyatv.const import Protocol
 from pyatv.protocols.airplay.auth import extract_credentials
 from pyatv.protocols.airplay.utils import (
     AirPlayMajorVersion,
+    dbfs_to_pct,
     get_protocol_version,
     pct_to_dbfs,
 )
@@ -524,6 +525,12 @@ class Output:
             return True
         return self.heard is not None and time.monotonic() - self.heard > SILENT_S
 
+    @property
+    def volume(self):
+        """Volume reported by the receiver in percent, if known."""
+        level = self.info.get("initialVolume")
+        return dbfs_to_pct(level) if isinstance(level, float) else None
+
     async def set_volume(self, percent: float):
         await self.rtsp.set_parameter("volume", str(pct_to_dbfs(percent)))
 
@@ -634,6 +641,7 @@ class Engine:
                     "age": time.monotonic() - o.joined,
                     "timing": self.timing.requests.get(o.address, 0),
                     "resends": o.control.resends if o.control else 0,
+                    "volume": o.volume,
                 }
                 for o in self.outputs
             ],
